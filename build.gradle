@@ -1,0 +1,242 @@
+// =============================================================================
+//  Chatulator – ein Projekt, alle Minecraft-Versionen, alle Loader
+//
+//  Alles bauen:                gradlew buildAll
+//  Nur eine Version:           gradlew buildAll -Ptargets=26.3
+//  Nur bestimmte Loader:       gradlew buildAll -Ploaders=fabric,neoforge
+//  Ein einzelnes Ziel:         gradlew :fabric-1.20.1:build
+//  Im Spiel testen:            gradlew :fabric-26.3:runClient   (Fabric)
+//                              gradlew :neoforge-26.3:runClient (NeoForge)
+//                              gradlew :forge-26.3:runClient    (Forge)
+//
+//  Fertige Jars landen in:     dist/
+// =============================================================================
+
+plugins {
+    // Nur laden (nicht anwenden) – die Unterprojekte wenden sie je nach Loader an.
+    id 'net.fabricmc.fabric-loom' apply false
+    id 'net.fabricmc.fabric-loom-remap' apply false
+    id 'net.neoforged.moddev' apply false
+    id 'net.neoforged.moddev.legacyforge' apply false
+    id 'net.minecraftforge.gradle' apply false
+}
+
+// true = Minecraft-Quellcode fuer die IDE dekompilieren (langsamer, braucht viel Platz)
+def decompileSources = providers.gradleProperty('decompile_sources').getOrElse('false').toBoolean()
+
+def modProperties = [
+        mod_id         : mod_id,
+        mod_name       : mod_name,
+        mod_version    : mod_version,
+        mod_authors    : mod_authors,
+        mod_license    : mod_license,
+        mod_description: mod_description,
+]
+
+def loadVersionProperties = { String mc ->
+    def props = new Properties()
+    rootProject.file("versions/${mc}.properties").withInputStream { props.load(it) }
+    return props
+}
+
+subprojects { p ->
+    def (String loader, String mc) = p.name.split('-', 2)
+    def vp = loadVersionProperties(mc)
+    int javaVersion = vp.getProperty('java_version') as int
+
+    p.ext.loader = loader
+    p.ext.mcTarget = mc
+    p.ext.versionProps = vp
+
+    p.group = mod_group_id
+    p.version = mod_version
+
+    // ---- Welche Code-Ordner gehoeren zu diesem Ziel? ---------------------------
+    // chat_api: versionsabhaengiger Zugriff auf das Chatfenster (platforms/chat-*)
+    def platforms = [vp.getProperty('chat_api')]
+    switch (loader) {
+        case 'fabric': platforms << 'fabric'; break
+        case 'forge': platforms << vp.getProperty('forge_platform'); break
+        case 'neoforge': platforms << 'neoforge'; break
+    }
+    if (loader != 'fabric' && vp.getProperty('pack_format')) {
+        platforms << 'pack-mcmeta'
+    }
+
+    // ---- Loader-Plugin anwenden -------------------------------------------------
+    p.apply plugin: 'java'
+
+    boolean fabricRemap = false
+    switch (loader) {
+        case 'fabric':
+            // Ab 26.1 ist Minecraft nicht mehr obfuskiert -> Loom ohne Remapping
+            fabricRemap = javaVersion < 25
+            p.apply plugin: fabricRemap ? 'net.fabricmc.fabric-loom-remap' : 'net.fabricmc.fabric-loom'
+            break
+        case 'forge':
+            if (mc == '1.20.1') {
+                // Forge 1.20.1 braucht Reobfuskierung nach SRG -> ModDevGradle Legacy
+                p.apply plugin: 'net.neoforged.moddev.legacyforge'
+            } else {
+                p.apply plugin: 'net.minecraftforge.gradle'
+            }
+            break
+        case 'neoforge':
+            p.apply plugin: 'net.neoforged.moddev'
+            break
+    }
+
+    p.base.archivesName = "${mod_id}-${loader}-${mc}"
+
+    p.java {
+        toolchain.languageVersion = JavaLanguageVersion.of(25)
+        sourceCompatibility = JavaVersion.toVersion(javaVersion)
+        targetCompatibility = JavaVersion.toVersion(javaVersion)
+    }
+
+    p.tasks.withType(JavaCompile).configureEach {
+        options.encoding = 'UTF-8'
+        options.release = javaVersion
+    }
+
+    p.sourceSets.main {
+        java.srcDirs = [rootProject.file('common/src/main/java')] +
+                platforms.collect { rootProject.file("platforms/${it}/java") } +
+                [p.file('src/main/java')]
+        resources.srcDirs = platforms.collect { rootProject.file("platforms/${it}/resources") } +
+                [p.file('src/main/resources')]
+    }
+
+    // ---- Loader-spezifische Konfiguration ---------------------------------------
+    switch (loader) {
+        case 'fabric':
+            p.dependencies {
+                minecraft "com.mojang:minecraft:${vp.minecraft_version}"
+                if (fabricRemap) {
+                    mappings p.loom.officialMojangMappings()
+                    modImplementation "net.fabricmc:fabric-loader:${vp.fabric_loader_version}"
+                    modImplementation "net.fabricmc.fabric-api:fabric-api:${vp.fabric_api_version}"
+                } else {
+                    implementation "net.fabricmc:fabric-loader:${vp.fabric_loader_version}"
+                    implementation "net.fabricmc.fabric-api:fabric-api:${vp.fabric_api_version}"
+                }
+            }
+            break
+
+        case 'forge':
+            if (mc == '1.20.1') {
+                p.legacyForge {
+                    enable {
+                        forgeVersion = vp.forge_version
+                        disableRecompilation = !decompileSources
+                    }
+                    runs {
+                        client {
+                            client()
+                            gameDirectory = p.file('run')
+                        }
+                    }
+                    mods {
+                        "${mod_id}" { sourceSet p.sourceSets.main }
+                    }
+                }
+            } else {
+                p.repositories {
+                    p.minecraft.mavenizer(it)
+                    maven p.fg.forgeMaven
+                    maven p.fg.minecraftLibsMaven
+                    mavenCentral()
+                }
+                p.dependencies {
+                    implementation p.minecraft.dependency("net.minecraftforge:forge:${vp.forge_version}")
+                }
+                p.minecraft {
+                    runs {
+                        register('client') {
+                            workingDir = p.layout.projectDirectory.dir('run')
+                        }
+                    }
+                }
+            }
+            break
+
+        case 'neoforge':
+            p.neoForge {
+                enable {
+                    version = vp.neoforge_version
+                    disableRecompilation = !decompileSources
+                }
+                runs {
+                    client {
+                        client()
+                        gameDirectory = p.file('run')
+                    }
+                }
+                mods {
+                    "${mod_id}" { sourceSet p.sourceSets.main }
+                }
+            }
+            break
+    }
+
+    // ---- Platzhalter in mods.toml / fabric.mod.json ersetzen ---------------------
+    def expandProps = modProperties + vp.collectEntries { k, v -> [(k): v] }
+    p.tasks.named('processResources', ProcessResources).configure {
+        inputs.properties(expandProps)
+        filesMatching(['META-INF/mods.toml', 'META-INF/neoforge.mods.toml', 'fabric.mod.json', 'pack.mcmeta']) {
+            expand(expandProps)
+        }
+    }
+
+    p.tasks.named('jar', Jar).configure {
+        manifest.attributes([
+                'Specification-Title'   : mod_id,
+                'Specification-Vendor'  : mod_authors,
+                'Specification-Version' : '1',
+                'Implementation-Title'  : "${mod_id}-${loader}-${mc}",
+                'Implementation-Version': mod_version,
+                'Implementation-Vendor' : mod_authors,
+        ])
+    }
+}
+
+// =============================================================================
+//  buildAll: baut alle Ziele und sammelt die fertigen Jars in dist/
+// =============================================================================
+def distDir = layout.projectDirectory.dir('dist')
+
+tasks.register('cleanDist', Delete) {
+    group = 'chatulator'
+    delete distDir
+}
+
+tasks.register('buildAll', Copy) {
+    group = 'chatulator'
+    description = 'Baut alle Versionen fuer alle Loader und kopiert die Jars nach dist/.'
+
+    dependsOn 'cleanDist'
+    dependsOn subprojects.collect { "${it.path}:build" }
+
+    into distDir
+
+    subprojects.each { sp ->
+        from(sp.layout.buildDirectory.dir('libs')) {
+            include '*.jar'
+            exclude '*-sources.jar', '*-dev.jar', '*-javadoc.jar'
+        }
+
+        // NeoForge 1.20.1 = Forge-Fork: das Forge-1.20.1-Jar laeuft dort unveraendert.
+        if (sp.ext.loader == 'forge' && sp.ext.versionProps.getProperty('neoforge_mode') == 'reuse-forge') {
+            from(sp.layout.buildDirectory.dir('libs')) {
+                include "${mod_id}-forge-${sp.ext.mcTarget}-*.jar"
+                exclude '*-sources.jar', '*-dev.jar', '*-javadoc.jar'
+                rename { it.replace("${mod_id}-forge-", "${mod_id}-neoforge-") }
+            }
+        }
+    }
+
+    doLast {
+        println "\nFertige Mod-Jars in ${distDir.asFile}:"
+        distDir.asFile.listFiles()?.sort()?.each { println "  ${it.name}" }
+    }
+}

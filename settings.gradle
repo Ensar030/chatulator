@@ -1,0 +1,51 @@
+pluginManagement {
+    repositories {
+        maven { name = 'Fabric'; url = 'https://maven.fabricmc.net/' }
+        maven { name = 'NeoForged'; url = 'https://maven.neoforged.net/releases' }
+        maven { name = 'MinecraftForge'; url = 'https://maven.minecraftforge.net/' }
+        gradlePluginPortal()
+        mavenCentral()
+    }
+    plugins {
+        id 'net.fabricmc.fabric-loom' version "${loom_version}"
+        id 'net.fabricmc.fabric-loom-remap' version "${loom_version}"
+        id 'net.neoforged.moddev' version "${moddev_version}"
+        id 'net.neoforged.moddev.legacyforge' version "${moddev_version}"
+        id 'net.minecraftforge.gradle' version "${forgegradle_version}"
+    }
+}
+
+plugins {
+    id 'org.gradle.toolchains.foojay-resolver-convention' version '1.0.0'
+}
+
+rootProject.name = 'chatulator'
+
+// ---------------------------------------------------------------------------
+// Fuer jede Ziel-Version (versions/<mc>.properties) und jeden Loader wird ein
+// Unterprojekt ":<loader>-<mc>" angelegt, z.B. ":fabric-1.20.1" oder ":neoforge-26.3".
+// Versions-spezifischer Code (falls je noetig) kommt nach versions/<mc>/<loader>/src/main/java
+// ---------------------------------------------------------------------------
+def targets = providers.gradleProperty('targets').get().split(',')*.trim().findAll { it }
+def selectedLoaders = providers.gradleProperty('loaders').getOrElse('fabric,forge,neoforge').split(',')*.trim()
+
+targets.each { mc ->
+    def propsFile = file("versions/${mc}.properties")
+    if (!propsFile.exists()) {
+        throw new GradleException("Unbekannte Ziel-Version '${mc}': ${propsFile} fehlt.")
+    }
+    def props = new Properties()
+    propsFile.withInputStream { props.load(it) }
+
+    props.getProperty('loaders').split(',')*.trim().each { loader ->
+        if (!selectedLoaders.contains(loader)) return
+        // NeoForge 1.20.1 nutzt das Forge-Jar (siehe versions/1.20.1.properties)
+        if (loader == 'neoforge' && props.getProperty('neoforge_mode') == 'reuse-forge') return
+
+        def name = "${loader}-${mc}"
+        def dir = file("versions/${mc}/${loader}")
+        dir.mkdirs()
+        include(name)
+        project(":${name}").projectDir = dir
+    }
+}
